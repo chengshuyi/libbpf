@@ -53,6 +53,7 @@
 #include "str_error.h"
 #include "libbpf_internal.h"
 #include "hashmap.h"
+#include "bpf_drv.h"
 #include "bpf_gen_internal.h"
 
 #ifndef BPF_FS_MAGIC
@@ -7140,6 +7141,15 @@ static struct bpf_object *bpf_object_open(const char *path, const void *obj_buf,
 	size_t log_size;
 	__u32 log_level;
 
+#ifdef CONFIG_BPF_DRV
+	bpf_drv_init();
+	if (bpf_drv_needed()) {
+		err = bpf_drv_open();
+		if (err < 0)
+			return ERR_PTR(err);
+	}
+#endif
+
 	if (elf_version(EV_CURRENT) == EV_NONE) {
 		pr_warn("failed to init libelf for %s\n",
 			path ? : "(mem buf)");
@@ -10089,6 +10099,26 @@ bpf_program__attach_kprobe_opts(const struct bpf_program *prog,
 	offset = OPTS_GET(opts, offset, 0);
 	pe_opts.bpf_cookie = OPTS_GET(opts, bpf_cookie, 0);
 
+#ifdef CONFIG_BPF_DRV
+	if (bpf_drv_needed()) {
+		link = calloc(1, sizeof(*link));
+		if (!link) 
+				return libbpf_err_ptr(-ENOMEM);
+
+		pfd = bpf_drv_attach_kprobe(prog, retprobe, func_name);
+		if (pfd < 0) {
+				pr_warn("prog '%s': failed to attach to %s '%s': %s\n",
+						prog->name, retprobe ? "kretprobe" : "kprobe", func_name,
+						libbpf_strerror_r(pfd, errmsg, sizeof(errmsg)));
+				return libbpf_err_ptr(pfd);
+		}
+		
+		link->detach = &bpf_link__detach_fd;
+		link->fd = pfd;
+		return link;
+	}
+#endif
+
 	legacy = determine_kprobe_perf_type() < 0;
 	if (!legacy) {
 		pfd = perf_event_open_probe(false /* uprobe */, retprobe,
@@ -11044,6 +11074,26 @@ struct bpf_link *bpf_program__attach_tracepoint_opts(const struct bpf_program *p
 	struct bpf_link *link;
 	int pfd, err;
 
+#ifdef CONFIG_BPF_DRV
+	if (bpf_drv_needed()) {
+		link = calloc(1, sizeof(*link));
+		if (!link)
+				return ERR_PTR(-ENOMEM);
+		
+		pfd = bpf_drv_attach_tracepoint(prog, tp_category, tp_name);
+		if (pfd < 0) {
+				pr_warn("prog '%s': failed to attach to tracepoint '%s/%s': %s\n",
+						prog->name, tp_category, tp_name,
+						libbpf_strerror_r(pfd, errmsg, sizeof(errmsg)));
+				return libbpf_err_ptr(pfd);
+		}
+
+		link->detach = &bpf_link__detach_fd;
+		link->fd = pfd;
+		return link;
+	}
+#endif
+
 	if (!OPTS_VALID(opts, bpf_tracepoint_opts))
 		return libbpf_err_ptr(-EINVAL);
 
@@ -11653,6 +11703,11 @@ struct perf_buffer *perf_buffer__new(int map_fd, size_t page_cnt,
 	attr.sample_type = PERF_SAMPLE_RAW;
 	attr.sample_period = 1;
 	attr.wakeup_events = 1;
+
+#ifdef CONFIG_BPF_DRV
+	if (bpf_drv_needed())
+		attr.config = PERF_COUNT_SW_DUMMY;
+#endif
 
 	p.attr = &attr;
 	p.sample_cb = sample_cb;
